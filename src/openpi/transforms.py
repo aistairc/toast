@@ -8,6 +8,7 @@ import jax
 import numpy as np
 from openpi_client import image_tools
 
+from openpi.models import toast as _toast
 from openpi.models import tokenizer as _tokenizer
 from openpi.shared import array_typing as at
 from openpi.shared import normalize as _normalize
@@ -214,6 +215,11 @@ class DeltaActions(DataTransformFn):
             return data
 
         state, actions = data["state"], data["actions"]
+
+        # Copy actions if actions is not a writeable np.ndarray instance
+        if isinstance(actions, np.ndarray) and not actions.flags.writeable:
+            actions = actions.copy()
+
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
         actions[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
@@ -245,6 +251,84 @@ class AbsoluteActions(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class DeltaToRelativeActions(DataTransformFn):
+    """Converts step-to-step delta actions (e.g., LIBERO dataset format) to state-relative actions.
+
+    LIBERO stores actions as differences between consecutive timesteps:
+        a[t] = pos[t+1] - pos[t]
+
+    This transform converts them to be relative to the current state (same format as DeltaActions output):
+        a'[t] = pos[t+1] - pos[current] = cumsum(a)[t]
+
+    During inference, pair with RelativeToDeltaActions (output transform) to recover delta actions
+    for execution in environments that expect delta actions (e.g., LIBERO).
+
+    Args:
+        mask: Boolean mask for the action dimensions to transform (same convention as DeltaActions).
+              If None, this transform is a no-op.
+    """
+
+    mask: Sequence[bool] | None
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "actions" not in data or self.mask is None:
+            return data
+
+        actions = data["actions"]
+        if isinstance(actions, np.ndarray) and not actions.flags.writeable:
+            actions = actions.copy()
+
+        import torch
+
+        mask = np.asarray(self.mask)
+        dims = mask.shape[-1]
+        if isinstance(actions, torch.Tensor):
+            cumsum = torch.cumsum(actions[..., :dims], dim=-2)
+            result = torch.where(torch.as_tensor(mask, device=actions.device), cumsum, actions[..., :dims])
+        else:
+            cumsum = np.cumsum(actions[..., :dims], axis=-2)
+            result = np.where(mask, cumsum, actions[..., :dims])
+        actions[..., :dims] = result
+        data["actions"] = actions
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class RelativeToDeltaActions(DataTransformFn):
+    """Converts state-relative actions back to step-to-step delta actions (inverse of DeltaToRelativeActions).
+
+    Applies consecutive differences (inverse of cumsum) to recover the original delta format:
+        a[t] = a'[t] - a'[t-1]   (with a'[-1] = 0)
+
+    Use as the output transform during inference when the policy was trained with DeltaToRelativeActions
+    and the environment expects delta actions (e.g., LIBERO).
+
+    Args:
+        mask: Boolean mask for the action dimensions to transform (same convention as DeltaToRelativeActions).
+              If None, this transform is a no-op.
+    """
+
+    mask: Sequence[bool] | None
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "actions" not in data or self.mask is None:
+            return data
+
+        actions = data["actions"]
+        if isinstance(actions, np.ndarray) and not actions.flags.writeable:
+            actions = actions.copy()
+
+        mask = np.asarray(self.mask)
+        dims = mask.shape[-1]
+        # Prepend zeros along the time axis to compute diff relative to the initial state
+        padded = np.concatenate([np.zeros_like(actions[..., :1, :dims]), actions[..., :dims]], axis=-2)
+        diff = np.diff(padded, axis=-2)
+        actions[..., :dims] = np.where(mask, diff, actions[..., :dims])
+        data["actions"] = actions
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class TokenizePrompt(DataTransformFn):
     tokenizer: _tokenizer.PaligemmaTokenizer
     discrete_state_input: bool = False
@@ -268,7 +352,7 @@ class TokenizePrompt(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class TokenizeFASTInputs(DataTransformFn):
-    tokenizer: _tokenizer.FASTTokenizer
+    tokenizer: _tokenizer.FASTTokenizer | _toast.TOASTTokenizer
 
     def __call__(self, data: DataDict) -> DataDict:
         if (prompt := data.pop("prompt", None)) is None:
@@ -290,7 +374,7 @@ class TokenizeFASTInputs(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class ExtractFASTActions(DataTransformFn):
-    tokenizer: _tokenizer.FASTTokenizer
+    tokenizer: _tokenizer.FASTTokenizer | _toast.TOASTTokenizer
     action_horizon: int
     action_dim: int
 

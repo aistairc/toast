@@ -23,6 +23,7 @@ class DroidActionSpace(Enum):
 
     JOINT_POSITION = auto()
     JOINT_VELOCITY = auto()
+    CARTESIAN_POSITION = auto()
 
 
 @dataclasses.dataclass
@@ -115,17 +116,16 @@ class DroidRldsDataset:
             def restructure(traj):
                 """Reformat observation and action keys, sample language instruction."""
                 # Important: we use joint *position* action space -- easier to simulate!
-                actions = tf.concat(
-                    (
-                        (
-                            traj["action_dict"]["joint_position"]
-                            if action_space == DroidActionSpace.JOINT_POSITION
-                            else traj["action_dict"]["joint_velocity"]
-                        ),
-                        traj["action_dict"]["gripper_position"],
-                    ),
-                    axis=-1,
-                )
+                match action_space:
+                    case DroidActionSpace.JOINT_POSITION:
+                        arm_actions = traj["action_dict"]["joint_position"]
+                    case DroidActionSpace.JOINT_VELOCITY:
+                        arm_actions = traj["action_dict"]["joint_velocity"]
+                    case DroidActionSpace.CARTESIAN_POSITION:
+                        arm_actions = traj["action_dict"]["cartesian_position"]
+                    case _:
+                        raise ValueError(f"Unsupported action space: {action_space}")
+                actions = tf.concat((arm_actions, traj["action_dict"]["gripper_position"]), axis=-1)
                 # Randomly samples one of the two exterior images in DROID during training (we only train with one at a time).
                 # Note: the "left" refers to the left camera in the stereo pair, we only train on the left camera.
                 exterior_img = tf.cond(
@@ -161,6 +161,7 @@ class DroidRldsDataset:
                         "image": exterior_img,
                         "wrist_image": wrist_img,
                         "joint_position": traj["observation"]["joint_position"],
+                        "cartesian_position": traj["observation"]["cartesian_position"],
                         "gripper_position": traj["observation"]["gripper_position"],
                     },
                     "prompt": instruction,

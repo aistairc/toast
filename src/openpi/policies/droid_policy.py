@@ -5,6 +5,7 @@ import numpy as np
 
 from openpi import transforms
 from openpi.models import model as _model
+from openpi.training import droid_rlds_dataset
 
 
 def make_droid_example() -> dict:
@@ -31,13 +32,19 @@ def _parse_image(image) -> np.ndarray:
 class DroidInputs(transforms.DataTransformFn):
     # Determines which model will be used.
     model_type: _model.ModelType
+    # Action space determines which observation is used as state (and thus as the reference of delta actions):
+    # the Cartesian end-effector pose for CARTESIAN_POSITION, the joint positions otherwise.
+    action_space: droid_rlds_dataset.DroidActionSpace | None = None
 
     def __call__(self, data: dict) -> dict:
         gripper_pos = np.asarray(data["observation/gripper_position"])
         if gripper_pos.ndim == 0:
             # Ensure gripper position is a 1D array, not a scalar, so we can concatenate with joint positions
             gripper_pos = gripper_pos[np.newaxis]
-        state = np.concatenate([data["observation/joint_position"], gripper_pos])
+        if self.action_space == droid_rlds_dataset.DroidActionSpace.CARTESIAN_POSITION:
+            state = np.concatenate([data["observation/cartesian_position"], gripper_pos])
+        else:
+            state = np.concatenate([data["observation/joint_position"], gripper_pos])
 
         # Possibly need to parse images to uint8 (H,W,C) since LeRobot automatically
         # stores as float32 (C,H,W), gets skipped for policy inference
@@ -79,3 +86,5 @@ class DroidOutputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         # Only return the first 8 dims.
         return {"actions": np.asarray(data["actions"][..., :8])}
+
+

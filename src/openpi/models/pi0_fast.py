@@ -88,6 +88,16 @@ class Pi0FASTConfig(_model.BaseModelConfig):
     # Keyword arguments for the fast model tokenizer.
     fast_model_tokenizer_kwargs: dict[str, Any] | None = None
 
+    # TOAST tokenizer (see openpi.models.toast). If set, the TOAST tokenizer in this directory (or Hugging Face
+    # repository) is used instead of the FAST tokenizer.
+    toast_action_tokenizer_dir: str | None = None
+    # If True, sample the subword segmentation during training (subword regularization) instead of always using
+    # the most likely one. `alpha` is the smoothing parameter and `nbest_size` the number of candidates to sample from
+    # (-1 samples from all segmentations).
+    sample_segmentation: bool = False
+    alpha: float = 0.1
+    nbest_size: int = 64
+
     @property
     @override
     def model_type(self) -> _model.ModelType:

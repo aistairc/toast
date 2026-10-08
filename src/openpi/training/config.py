@@ -16,6 +16,7 @@ import tyro
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
+import openpi.models.toast as _toast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
@@ -25,6 +26,7 @@ import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
+import openpi.training.misc.toast_config as toast_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
@@ -137,14 +139,25 @@ class ModelTransformFactory(GroupFactory):
                     ],
                 )
             case _model.ModelType.PI0_FAST:
-                tokenizer_cls = (
-                    _tokenizer.FASTTokenizer
-                    if model_config.fast_model_tokenizer is None
-                    else model_config.fast_model_tokenizer
-                )
-                tokenizer_kwargs = (
-                    {} if model_config.fast_model_tokenizer_kwargs is None else model_config.fast_model_tokenizer_kwargs
-                )
+                if model_config.toast_action_tokenizer_dir:
+                    tokenizer_cls = _toast.TOASTTokenizer
+                    tokenizer_kwargs = {
+                        "toast_tokenizer_path": model_config.toast_action_tokenizer_dir,
+                        "sample_segmentation": model_config.sample_segmentation,
+                        "alpha": model_config.alpha,
+                        "nbest_size": model_config.nbest_size,
+                    }
+                else:
+                    tokenizer_cls = (
+                        _tokenizer.FASTTokenizer
+                        if model_config.fast_model_tokenizer is None
+                        else model_config.fast_model_tokenizer
+                    )
+                    tokenizer_kwargs = (
+                        {}
+                        if model_config.fast_model_tokenizer_kwargs is None
+                        else model_config.fast_model_tokenizer_kwargs
+                    )
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
@@ -287,6 +300,9 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
     """
 
     extra_delta_transform: bool = False
+    # If True, converts LIBERO's step-to-step delta actions into actions relative to the state at the start of the
+    # chunk (cumulative sum over the chunk), and back to step-to-step deltas at inference time.
+    delta_to_relative_transform: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -341,6 +357,12 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
             )
+        elif self.delta_to_relative_transform:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaToRelativeActions(delta_action_mask)],
+                outputs=[_transforms.RelativeToDeltaActions(delta_action_mask)],
+            )
 
         # Model transforms include things like tokenizing the prompt and action targets
         # You do not need to change anything here for your own dataset.
@@ -378,31 +400,40 @@ class RLDSDroidDataConfig(DataConfigFactory):
         ),
     )
 
+    # Only used with the CARTESIAN_POSITION action space. If True, converts the absolute end-effector pose actions
+    # into actions relative to the pose at the start of the chunk. If False, the actions stay absolute.
+    relative_transform: bool = False
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/exterior_image_1_left": "observation/image",
-                        "observation/wrist_image_left": "observation/wrist_image",
-                        "observation/joint_position": "observation/joint_position",
-                        "observation/gripper_position": "observation/gripper_position",
-                        "actions": "actions",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
-        )
+        is_cartesian = self.action_space == droid_rlds_dataset.DroidActionSpace.CARTESIAN_POSITION
+        repack_keys = {
+            "observation/exterior_image_1_left": "observation/image",
+            "observation/wrist_image_left": "observation/wrist_image",
+            "observation/joint_position": "observation/joint_position",
+            "observation/gripper_position": "observation/gripper_position",
+            "actions": "actions",
+            "prompt": "prompt",
+        }
+        if is_cartesian:
+            repack_keys["observation/cartesian_position"] = "observation/cartesian_position"
+        repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_keys)])
 
         data_transforms = _transforms.Group(
-            inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
+            inputs=[droid_policy.DroidInputs(model_type=model_config.model_type, action_space=self.action_space)],
             outputs=[droid_policy.DroidOutputs()],
         )
 
         if self.action_space == droid_rlds_dataset.DroidActionSpace.JOINT_POSITION:
             # Data loader returns absolute joint position actions -- convert to delta actions for training.
             delta_action_mask = _transforms.make_bool_mask(7, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+        elif is_cartesian and self.relative_transform:
+            # Data loader returns absolute end-effector pose actions -- make them relative to the current pose.
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
@@ -968,6 +999,8 @@ _CONFIGS = [
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
+    # TOAST tokenizer configs.
+    *toast_config.get_toast_configs(),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
